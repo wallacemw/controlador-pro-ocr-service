@@ -1,0 +1,17 @@
+.git
+.vercel
+.vercel-cli
+__pycache__
+*.pyc
+*.pyo
+*.png
+*.log
+.env
+.env.local
+benchmark-*
+dump-*
+ASSETANA_*
+controlador-gastos-v10_4-4.html
+receipt-ocr-override.js
+README.md
+supabase-schema-controlador-gastos.sql

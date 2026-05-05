@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: controlador-pro-ocr
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.ocr
+    dockerContext: .
+    autoDeployTrigger: commit
+    healthCheckPath: /health
+    envVars:
+      - key: RECEIPT_SERVICE_HOST
+        value: 0.0.0.0
+      - key: RECEIPT_SERVICE_PORT
+        value: "10000"
+      - key: RECEIPT_OCR_LANG
+        value: pt
+      - key: OCR_SERVICE_ENFORCE_SHARED_SECRET
+        value: "1"
+      - key: OCR_SERVICE_SHARED_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
