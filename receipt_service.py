@@ -139,7 +139,7 @@ def _build_upstream_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str,
     return headers
 
 
-def _call_upstream_json(path: str, *, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _call_upstream_json(path: str, *, method: str = "GET", payload: Optional[Dict[str, Any]] = None, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
     if not OCR_SERVICE_UPSTREAM_URL:
         raise RuntimeError("OCR upstream nao configurado.")
     body = None
@@ -153,7 +153,8 @@ def _call_upstream_json(path: str, *, method: str = "GET", payload: Optional[Dic
         headers=headers,
         method=method.upper(),
     )
-    timeout = max(5, OCR_SERVICE_UPSTREAM_TIMEOUT_MS / 1000)
+    effective_timeout_ms = timeout_ms if timeout_ms is not None else OCR_SERVICE_UPSTREAM_TIMEOUT_MS
+    timeout = max(3, effective_timeout_ms / 1000)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
@@ -994,7 +995,7 @@ def build_health_payload() -> Dict[str, Any]:
     service_up = True
     if _upstream_proxy_enabled():
         try:
-            upstream = _call_upstream_json("/health", method="GET")
+            upstream = _call_upstream_json("/health", method="GET", timeout_ms=min(OCR_SERVICE_UPSTREAM_TIMEOUT_MS, 4500))
             upstream_backends = upstream.get("backends") or {}
             if upstream_backends:
                 backends = {
@@ -1124,7 +1125,7 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             try:
                 upstream_payload = dict(payload)
                 upstream_payload["strategy"] = strategy or "auto"
-                upstream = _call_upstream_json("/api/receipt/parse", method="POST", payload=upstream_payload)
+                upstream = _call_upstream_json("/api/receipt/parse", method="POST", payload=upstream_payload, timeout_ms=OCR_SERVICE_UPSTREAM_TIMEOUT_MS)
                 upstream_backends = upstream.get("backends") or {}
                 if upstream_backends:
                     backends = {
@@ -1230,9 +1231,6 @@ class ReceiptServiceHandler(BaseHTTPRequestHandler):
         path, _query = _parse_query(self.path)
         if path != "/health":
             _json_response(self, 404, build_error_payload("receipt_service.health", "not_found", details={"message": "Endpoint nao encontrado."}))
-            return
-        if not _proxy_secret_authorized(self):
-            _json_response(self, 401, _proxy_secret_error_payload())
             return
         _json_response(self, 200, build_health_payload())
 
