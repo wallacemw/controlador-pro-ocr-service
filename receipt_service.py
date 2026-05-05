@@ -613,9 +613,10 @@ def parse_receipt_text(raw: str, source: str = "service_ocr", pages_processed: i
     for line in totals:
         amount = _line_amount(line)
         upper = line.upper()
-        if amount > 0 and re.search(r"TOTAL A PAGAR|VALOR A PAGAR|TOTAL GERAL|TOTAL LIQUIDO|VALOR TOTAL|TOTAL FINAL|TOTAL\b", upper):
+        is_subtotal_line = bool(re.search(r"SUBTOTAL|SUB TOTAL|VALOR DOS PRODUTOS|VALOR DOS ITENS", upper))
+        if amount > 0 and not is_subtotal_line and re.search(r"TOTAL A PAGAR|VALOR A PAGAR|TOTAL GERAL|TOTAL LIQUIDO|VALOR TOTAL|TOTAL FINAL|\bTOTAL\b", upper):
             grand_total = max(grand_total, amount)
-        if amount > 0 and re.search(r"SUBTOTAL|SUB TOTAL|VALOR DOS PRODUTOS|VALOR DOS ITENS", upper):
+        if amount > 0 and is_subtotal_line:
             subtotal = max(subtotal, amount)
 
     discounts: List[Dict[str, Any]] = []
