@@ -1293,7 +1293,12 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             except Exception as err:
                 upstream_error = str(err or "").strip()
 
-        if _paddle_ocr_available() and image_b64 and (strategy in {"ocr", "auto"} or best_result is None or _needs_llm(best_result)):
+        should_run_paddle = (
+            strategy == "ocr"
+            or best_result is None
+            or (strategy == "auto" and _needs_llm(best_result))
+        )
+        if _paddle_ocr_available() and image_b64 and should_run_paddle:
             ocr_text, blocks = ocr_with_paddle(image_b64)
             if ocr_text.strip():
                 ocr_result = parse_receipt_text(ocr_text, source="service_ocr", pages_processed=pages_processed)
