@@ -12,6 +12,7 @@ import re
 import secrets
 import sys
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -48,17 +49,31 @@ _load_env_file(PROJECT_ROOT / ".env.local")
 _load_env_file(PROJECT_ROOT / ".env")
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
 HOST = os.getenv("RECEIPT_SERVICE_HOST", "127.0.0.1")
 PORT = int(os.getenv("RECEIPT_SERVICE_PORT", "8787"))
 RUNNING_ON_VERCEL = bool(os.getenv("VERCEL"))
 OCR_SERVICE_UPSTREAM_URL = os.getenv("OCR_SERVICE_UPSTREAM_URL", "").strip().rstrip("/")
 OCR_SERVICE_UPSTREAM_TIMEOUT_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_TIMEOUT_MS", "25000") or "25000")
 OCR_SERVICE_SHARED_SECRET = os.getenv("OCR_SERVICE_SHARED_SECRET", "").strip()
-OCR_SERVICE_ENFORCE_SHARED_SECRET = str(os.getenv("OCR_SERVICE_ENFORCE_SHARED_SECRET", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+OCR_SERVICE_ENFORCE_SHARED_SECRET = _env_flag("OCR_SERVICE_ENFORCE_SHARED_SECRET", False)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OCR_LANG = os.getenv("RECEIPT_OCR_LANG", "pt")
+PADDLE_OCR_ENABLE_WARMUP = _env_flag("PADDLE_OCR_ENABLE_WARMUP", True)
+PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY = _env_flag("PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY", False)
+PADDLE_OCR_USE_DOC_UNWARPING = _env_flag("PADDLE_OCR_USE_DOC_UNWARPING", False)
+PADDLE_OCR_USE_TEXTLINE_ORIENTATION = _env_flag("PADDLE_OCR_USE_TEXTLINE_ORIENTATION", False)
+PADDLE_OCR_TEXT_DETECTION_MODEL_NAME = (os.getenv("PADDLE_OCR_TEXT_DETECTION_MODEL_NAME", "PP-OCRv5_mobile_det") or "").strip()
+PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME = (os.getenv("PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME", "") or "").strip()
+PADDLE_OCR_STARTUP_GRACE_MS = int(os.getenv("PADDLE_OCR_STARTUP_GRACE_MS", "8000") or "8000")
 SUPABASE_PROJECT_URL = os.getenv("SUPABASE_PROJECT_URL", "https://zphgusvzgbznljqpozab.supabase.co").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_0GdmO02259hS8KydGNHCsw_JF1t5vG6").strip()
 ABLY_APP_NAMESPACE = os.getenv("ABLY_APP_NAMESPACE", "controlador-gastos-pro")
@@ -71,6 +86,14 @@ _PADDLE_OCR = None
 _PADDLE_OCR_CLASS = None
 _PADDLE_IMPORT_ATTEMPTED = False
 _PADDLE_IMPORT_ERROR = ""
+_PADDLE_OCR_LOCK = threading.Lock()
+_PADDLE_WARMUP_EVENT = threading.Event()
+_PADDLE_WARMUP_THREAD = None
+_PADDLE_WARMUP_STATE = "idle"
+_PADDLE_WARMUP_ERROR = ""
+_PADDLE_WARMUP_DURATION_MS = 0
+_PADDLE_WARMUP_STARTED_AT = 0.0
+_PADDLE_WARMUP_FINISHED_AT = 0.0
 
 
 def _send_cors_headers(handler: BaseHTTPRequestHandler) -> None:
@@ -731,6 +754,54 @@ def _paddle_ocr_available() -> bool:
     return importlib.util.find_spec("paddleocr") is not None
 
 
+def _build_paddle_ocr_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "lang": OCR_LANG,
+        "use_doc_orientation_classify": PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY,
+        "use_doc_unwarping": PADDLE_OCR_USE_DOC_UNWARPING,
+        "use_textline_orientation": PADDLE_OCR_USE_TEXTLINE_ORIENTATION,
+    }
+    if PADDLE_OCR_TEXT_DETECTION_MODEL_NAME:
+        kwargs["text_detection_model_name"] = PADDLE_OCR_TEXT_DETECTION_MODEL_NAME
+    if PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME:
+        kwargs["text_recognition_model_name"] = PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME
+    return kwargs
+
+
+def _paddle_warmup_details() -> Dict[str, Any]:
+    details = {
+        "enabled": bool(PADDLE_OCR_ENABLE_WARMUP),
+        "state": _PADDLE_WARMUP_STATE,
+        "durationMs": int(_PADDLE_WARMUP_DURATION_MS or 0),
+        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_PADDLE_WARMUP_STARTED_AT)) if _PADDLE_WARMUP_STARTED_AT else "",
+        "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_PADDLE_WARMUP_FINISHED_AT)) if _PADDLE_WARMUP_FINISHED_AT else "",
+        "error": _PADDLE_WARMUP_ERROR,
+        "config": {
+            "lang": OCR_LANG,
+            "use_doc_orientation_classify": PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY,
+            "use_doc_unwarping": PADDLE_OCR_USE_DOC_UNWARPING,
+            "use_textline_orientation": PADDLE_OCR_USE_TEXTLINE_ORIENTATION,
+            "text_detection_model_name": PADDLE_OCR_TEXT_DETECTION_MODEL_NAME or "",
+            "text_recognition_model_name": PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME or "",
+        },
+    }
+    return details
+
+
+def _mark_paddle_warmup_state(state: str, *, error: str = "", started_at: Optional[float] = None, finished_at: Optional[float] = None) -> None:
+    global _PADDLE_WARMUP_STATE, _PADDLE_WARMUP_ERROR, _PADDLE_WARMUP_DURATION_MS, _PADDLE_WARMUP_STARTED_AT, _PADDLE_WARMUP_FINISHED_AT
+    _PADDLE_WARMUP_STATE = state
+    if started_at is not None:
+        _PADDLE_WARMUP_STARTED_AT = started_at
+    if finished_at is not None:
+        _PADDLE_WARMUP_FINISHED_AT = finished_at
+        if _PADDLE_WARMUP_STARTED_AT:
+            _PADDLE_WARMUP_DURATION_MS = int(max(0.0, finished_at - _PADDLE_WARMUP_STARTED_AT) * 1000)
+    _PADDLE_WARMUP_ERROR = str(error or "").strip()
+    if state in {"ready", "error"}:
+        _PADDLE_WARMUP_EVENT.set()
+
+
 def _load_paddle_ocr_class():
     global _PADDLE_OCR_CLASS, _PADDLE_IMPORT_ATTEMPTED, _PADDLE_IMPORT_ERROR
     if _PADDLE_IMPORT_ATTEMPTED:
@@ -746,16 +817,85 @@ def _load_paddle_ocr_class():
     return _PADDLE_OCR_CLASS
 
 
+def _build_paddle_warmup_image():
+    if Image is None:
+        return None
+    image = Image.new("RGB", (720, 240), "white")
+    try:
+        from PIL import ImageDraw  # type: ignore
+
+        draw = ImageDraw.Draw(image)
+        draw.text((24, 28), "MERCADO TESTE", fill="black")
+        draw.text((24, 90), "ARROZ 2 x 3,50 7,00", fill="black")
+        draw.text((24, 140), "TOTAL 7,00", fill="black")
+    except Exception:
+        return image
+    return image
+
+
+def _warm_paddle_ocr(ocr: Any) -> None:
+    warm_image = _build_paddle_warmup_image()
+    if warm_image is None:
+        return
+    try:
+        ocr.ocr(warm_image)
+    except Exception as err:
+        raise RuntimeError(f"Falha ao aquecer PaddleOCR: {err}") from err
+
+
 def _get_paddle_ocr():
-    global _PADDLE_OCR
+    global _PADDLE_OCR, _PADDLE_IMPORT_ERROR
     if not _paddle_ocr_available():
         return None
     paddle_ocr_class = _load_paddle_ocr_class()
     if paddle_ocr_class is None:
         return None
-    if _PADDLE_OCR is None:
-        _PADDLE_OCR = paddle_ocr_class(use_angle_cls=True, lang=OCR_LANG)
+    with _PADDLE_OCR_LOCK:
+        if _PADDLE_WARMUP_STATE == "error":
+            _PADDLE_OCR = None
+        if _PADDLE_OCR is None:
+            _PADDLE_WARMUP_EVENT.clear()
+            started_at = time.time()
+            _mark_paddle_warmup_state("warming", started_at=started_at)
+            try:
+                _PADDLE_OCR = paddle_ocr_class(**_build_paddle_ocr_kwargs())
+                _warm_paddle_ocr(_PADDLE_OCR)
+                _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
+            except Exception as err:
+                _PADDLE_OCR = None
+                _PADDLE_IMPORT_ERROR = str(err)
+                _mark_paddle_warmup_state("error", error=str(err), started_at=started_at, finished_at=time.time())
+                raise
+        elif _PADDLE_WARMUP_STATE != "ready":
+            started_at = _PADDLE_WARMUP_STARTED_AT or time.time()
+            _mark_paddle_warmup_state("warming", started_at=started_at)
+            try:
+                _warm_paddle_ocr(_PADDLE_OCR)
+                _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
+            except Exception as err:
+                _PADDLE_IMPORT_ERROR = str(err)
+                _mark_paddle_warmup_state("error", error=str(err), started_at=started_at, finished_at=time.time())
+                raise
     return _PADDLE_OCR
+
+
+def _start_paddle_warmup() -> None:
+    global _PADDLE_WARMUP_THREAD
+    if not PADDLE_OCR_ENABLE_WARMUP or not _paddle_ocr_available():
+        return
+    if _PADDLE_WARMUP_STATE == "ready":
+        return
+    if _PADDLE_WARMUP_THREAD and _PADDLE_WARMUP_THREAD.is_alive():
+        return
+
+    def _runner() -> None:
+        try:
+            _get_paddle_ocr()
+        except Exception as err:
+            print(f"[receipt_service] paddle warmup failed: {err}", file=sys.stderr)
+
+    _PADDLE_WARMUP_THREAD = threading.Thread(target=_runner, name="paddleocr-warmup", daemon=True)
+    _PADDLE_WARMUP_THREAD.start()
 
 
 def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
@@ -949,6 +1089,7 @@ def build_backend_flags() -> Dict[str, Any]:
         "paddleocr": _paddle_ocr_available(),
         "llm_fallback": bool(OPENAI_API_KEY),
         "openai": bool(OPENAI_API_KEY),
+        "paddle_ready": _PADDLE_WARMUP_STATE == "ready",
     }
 
 
@@ -961,6 +1102,8 @@ def _build_receipt_mode(backends: Dict[str, Any]) -> str:
 
 
 def _build_receipt_runtime_message(backends: Dict[str, Any]) -> str:
+    if backends.get("paddleocr") and not backends.get("paddle_ready"):
+        return "PaddleOCR disponivel e em aquecimento; as primeiras leituras podem degradar ate o warm-up terminar."
     if backends.get("paddleocr") and backends.get("llm_fallback"):
         return "OCR estruturado pronto com PaddleOCR e fallback LLM."
     if backends.get("paddleocr"):
@@ -988,9 +1131,10 @@ def build_health_payload() -> Dict[str, Any]:
     backends = build_backend_flags()
     mode = _build_receipt_mode(backends)
     details = {
-        "severity": "ok" if backends.get("paddleocr") else "warn",
+        "severity": "ok" if backends.get("paddleocr") and backends.get("paddle_ready") else "warn",
         "message": _build_receipt_runtime_message(backends),
         "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
+        "paddle": _paddle_warmup_details(),
     }
     service_up = True
     if _upstream_proxy_enabled():
@@ -1009,6 +1153,7 @@ def build_health_payload() -> Dict[str, Any]:
                 "severity": upstream.get("details", {}).get("severity") or ("ok" if backends.get("paddleocr") else "warn"),
                 "message": upstream.get("details", {}).get("message") or "OCR dedicado activo via upstream.",
                 "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
+                "paddle": upstream.get("details", {}).get("paddle") or {},
                 "proxy": {
                     "enabled": True,
                     "upstream": OCR_SERVICE_UPSTREAM_URL,
@@ -1263,6 +1408,9 @@ class ReceiptServiceHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), ReceiptServiceHandler)
+    _start_paddle_warmup()
+    if PADDLE_OCR_ENABLE_WARMUP and PADDLE_OCR_STARTUP_GRACE_MS > 0 and _paddle_ocr_available():
+        _PADDLE_WARMUP_EVENT.wait(timeout=max(0, PADDLE_OCR_STARTUP_GRACE_MS) / 1000)
     print(f"[receipt_service] listening on http://{HOST}:{PORT}")
     try:
         server.serve_forever()

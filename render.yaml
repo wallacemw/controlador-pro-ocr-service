@@ -14,6 +14,18 @@ services:
         value: "10000"
       - key: RECEIPT_OCR_LANG
         value: pt
+      - key: PADDLE_OCR_ENABLE_WARMUP
+        value: "1"
+      - key: PADDLE_OCR_STARTUP_GRACE_MS
+        value: "8000"
+      - key: PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY
+        value: "0"
+      - key: PADDLE_OCR_USE_DOC_UNWARPING
+        value: "0"
+      - key: PADDLE_OCR_USE_TEXTLINE_ORIENTATION
+        value: "0"
+      - key: PADDLE_OCR_TEXT_DETECTION_MODEL_NAME
+        value: PP-OCRv5_mobile_det
       - key: OCR_SERVICE_ENFORCE_SHARED_SECRET
         value: "1"
       - key: OCR_SERVICE_SHARED_SECRET

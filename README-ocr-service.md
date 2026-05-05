@@ -54,11 +54,19 @@ Depois do deploy, guarde a URL pública do OCR dedicado, por exemplo:
 Configure no serviço OCR:
 
 - `RECEIPT_SERVICE_HOST=0.0.0.0`
-- `RECEIPT_SERVICE_PORT=8080`
+- `RECEIPT_SERVICE_PORT=10000`
 - `RECEIPT_OCR_LANG=pt`
 - `OPENAI_API_KEY=` opcional
 - `OCR_SERVICE_SHARED_SECRET=uma-chave-forte`
 - `OCR_SERVICE_ENFORCE_SHARED_SECRET=1`
+- `PADDLE_OCR_ENABLE_WARMUP=1`
+- `PADDLE_OCR_STARTUP_GRACE_MS=8000`
+- `PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY=0`
+- `PADDLE_OCR_USE_DOC_UNWARPING=0`
+- `PADDLE_OCR_USE_TEXTLINE_ORIENTATION=0`
+- `PADDLE_OCR_TEXT_DETECTION_MODEL_NAME=PP-OCRv5_mobile_det`
+
+Esses defaults reduzem o cold start e aquecem o PaddleOCR antes da primeira leitura com imagem.
 
 ## Variáveis na Vercel
 
