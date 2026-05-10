@@ -29,6 +29,11 @@ except Exception:  # pragma: no cover - optional dependency
     ImageFilter = None
     ImageOps = None
 
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    np = None
+
 
 def _load_env_file(path: Path) -> None:
     if not path.exists():
@@ -843,7 +848,7 @@ def _warm_paddle_ocr(ocr: Any) -> None:
     if warm_image is None:
         return
     try:
-        ocr.ocr(warm_image)
+        ocr.ocr(_image_to_ocr_input(warm_image))
     except Exception as err:
         raise RuntimeError(f"Falha ao aquecer PaddleOCR: {err}") from err
 
@@ -932,6 +937,15 @@ def _build_ocr_variants(image: Any) -> List[tuple[str, Any]]:
     return variants
 
 
+def _image_to_ocr_input(image: Any) -> Any:
+    if np is None or Image is None or image is None:
+        return image
+    try:
+        return np.array(image)
+    except Exception:
+        return image
+
+
 def _get_paddle_ocr():
     global _PADDLE_OCR, _PADDLE_IMPORT_ERROR
     if not _paddle_ocr_available():
@@ -993,7 +1007,7 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
     best_score = -1.0
     for _, variant in _build_ocr_variants(image):
         try:
-            result = ocr.ocr(variant)
+            result = ocr.ocr(_image_to_ocr_input(variant))
         except Exception:
             continue
         text, blocks = _extract_paddle_text(result)
