@@ -745,6 +745,23 @@ def _needs_llm(result: Optional[Dict[str, Any]]) -> bool:
     return _score_extraction(result) < 0.72
 
 
+def _should_try_image_only_llm_recovery(
+    *,
+    local_text: str,
+    image_b64: str,
+    best_result: Optional[Dict[str, Any]],
+    ocr_text_length: int,
+    ocr_blocks_count: int,
+) -> bool:
+    if not OPENAI_API_KEY or not image_b64:
+        return False
+    if str(local_text or "").strip():
+        return False
+    if ocr_blocks_count > 0 or ocr_text_length > 0:
+        return False
+    return best_result is None or _needs_llm(best_result)
+
+
 def _decode_image(b64: str):
     if not b64:
         return None
@@ -1436,7 +1453,15 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                     best_result = ocr_result
                     local_text = ocr_text
 
-        if strategy in {"llm", "auto"} and image_b64 and OPENAI_API_KEY and _needs_llm(best_result):
+        should_try_llm = strategy in {"llm", "auto"} and image_b64 and OPENAI_API_KEY and _needs_llm(best_result)
+        should_try_image_only_llm = _should_try_image_only_llm_recovery(
+            local_text=local_text,
+            image_b64=image_b64,
+            best_result=best_result,
+            ocr_text_length=ocr_text_length,
+            ocr_blocks_count=ocr_blocks_count,
+        )
+        if should_try_llm or should_try_image_only_llm:
             llm_result = llm_extract_receipt(OpenAIReceiptRequest(
                 local_text=local_text,
                 image_b64=image_b64,
@@ -1445,6 +1470,9 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             ))
             if best_result is None or _score_extraction(llm_result) >= _score_extraction(best_result):
                 best_result = llm_result
+                best_result.setdefault("diagnostics", {})
+                if should_try_image_only_llm:
+                    best_result["diagnostics"]["imageOnlyLlmRecovery"] = True
 
         if best_result is None:
             raise RuntimeError("Nenhum backend conseguiu estruturar o recibo.")
