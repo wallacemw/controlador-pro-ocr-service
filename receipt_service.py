@@ -22,9 +22,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     Image = None
+    ImageEnhance = None
+    ImageFilter = None
+    ImageOps = None
 
 
 def _load_env_file(path: Path) -> None:
@@ -844,6 +847,90 @@ def _warm_paddle_ocr(ocr: Any) -> None:
         raise RuntimeError(f"Falha ao aquecer PaddleOCR: {err}") from err
 
 
+def _ocr_has_signal(text: str, blocks: List[Any]) -> bool:
+    text = str(text or "").strip()
+    if len(text) >= 20:
+        return True
+    return bool(blocks)
+
+
+def _extract_paddle_text(result: Any) -> tuple[str, list]:
+    lines: List[str] = []
+    blocks: List[Any] = []
+    for page in result or []:
+        for block in page or []:
+            text = block[1][0] if len(block) > 1 and block[1] else ""
+            score = block[1][1] if len(block) > 1 and block[1] else None
+            if text:
+                clean = re.sub(r"\s+", " ", str(text)).strip()
+                if not clean:
+                    continue
+                lines.append(clean)
+                blocks.append({"text": clean, "confidence": score, "bbox": block[0]})
+    return "\n".join(lines), blocks
+
+
+def _score_ocr_candidate(text: str, blocks: List[Any]) -> float:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return 0.0
+    score = len(lines) * 0.12
+    summary_hits = 0
+    item_hits = 0
+    amount_hits = 0
+    for line in lines:
+        if re.search(r"\d{1,6}(?:[.,]\d{3})*[.,]\d{2}", line):
+            amount_hits += 1
+        if _is_summary_line(line):
+            summary_hits += 1
+        if _looks_like_item_line(line):
+            item_hits += 1
+    score += amount_hits * 0.35
+    score += summary_hits * 0.7
+    score += item_hits * 1.25
+    score += min(len(blocks), 12) * 0.05
+    return score
+
+
+def _resample_lanczos() -> Any:
+    if Image is None:
+        return None
+    try:
+        return Image.Resampling.LANCZOS  # type: ignore[attr-defined]
+    except Exception:
+        return getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", None))
+
+
+def _build_ocr_variants(image: Any) -> List[tuple[str, Any]]:
+    if Image is None or image is None:
+        return [("original", image)]
+    variants: List[tuple[str, Any]] = [("original", image)]
+    try:
+        oriented = ImageOps.exif_transpose(image) if ImageOps is not None else image
+    except Exception:
+        oriented = image
+    if oriented is not image:
+        variants[0] = ("original", oriented)
+    try:
+        gray = ImageOps.grayscale(oriented) if ImageOps is not None else oriented.convert("L")
+        auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
+        variants.append(("autocontrast", auto.convert("RGB")))
+        resample = _resample_lanczos()
+        if resample is not None:
+            upscaled = auto.resize((max(1, auto.width * 2), max(1, auto.height * 2)), resample)
+        else:
+            upscaled = auto.resize((max(1, auto.width * 2), max(1, auto.height * 2)))
+        if ImageEnhance is not None:
+            upscaled = ImageEnhance.Contrast(upscaled).enhance(1.35)
+            upscaled = ImageEnhance.Sharpness(upscaled).enhance(1.7)
+        if ImageFilter is not None:
+            upscaled = upscaled.filter(ImageFilter.SHARPEN)
+        variants.append(("upscaled", upscaled.convert("RGB")))
+    except Exception:
+        pass
+    return variants
+
+
 def _get_paddle_ocr():
     global _PADDLE_OCR, _PADDLE_IMPORT_ERROR
     if not _paddle_ocr_available():
@@ -909,17 +996,23 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
     ocr = _get_paddle_ocr()
     if ocr is None:
         raise RuntimeError(_PADDLE_IMPORT_ERROR or "PaddleOCR não está disponível neste ambiente.")
-    result = ocr.ocr(image)
-    lines: List[str] = []
-    blocks: List[Any] = []
-    for page in result or []:
-        for block in page or []:
-            text = block[1][0] if len(block) > 1 and block[1] else ""
-            score = block[1][1] if len(block) > 1 and block[1] else None
-            if text:
-                lines.append(text)
-                blocks.append({"text": text, "confidence": score, "bbox": block[0]})
-    return "\n".join(lines), blocks
+    best_text = ""
+    best_blocks: List[Any] = []
+    best_score = -1.0
+    for _, variant in _build_ocr_variants(image):
+        try:
+            result = ocr.ocr(variant)
+        except Exception:
+            continue
+        text, blocks = _extract_paddle_text(result)
+        candidate_score = _score_ocr_candidate(text, blocks)
+        if candidate_score > best_score:
+            best_score = candidate_score
+            best_text = text
+            best_blocks = blocks
+        if candidate_score >= 4.2 and _ocr_has_signal(text, blocks):
+            break
+    return best_text, best_blocks
 
 
 @dataclass
