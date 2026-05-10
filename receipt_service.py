@@ -71,6 +71,7 @@ OPENAI_MODEL = os.getenv("OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OCR_LANG = os.getenv("RECEIPT_OCR_LANG", "pt")
 PADDLE_OCR_ENABLE_WARMUP = _env_flag("PADDLE_OCR_ENABLE_WARMUP", True)
+PADDLE_OCR_WARMUP_ON_STARTUP = _env_flag("PADDLE_OCR_WARMUP_ON_STARTUP", False)
 PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY = _env_flag("PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY", False)
 PADDLE_OCR_USE_DOC_UNWARPING = _env_flag("PADDLE_OCR_USE_DOC_UNWARPING", False)
 PADDLE_OCR_USE_TEXTLINE_ORIENTATION = _env_flag("PADDLE_OCR_USE_TEXTLINE_ORIENTATION", False)
@@ -1188,6 +1189,8 @@ def _build_receipt_mode(backends: Dict[str, Any]) -> str:
 
 def _build_receipt_runtime_message(backends: Dict[str, Any]) -> str:
     if backends.get("paddleocr") and not backends.get("paddle_ready"):
+        if _PADDLE_WARMUP_STATE == "idle":
+            return "PaddleOCR disponivel sob demanda; a primeira leitura apos cold start pode levar mais tempo."
         return "PaddleOCR disponivel e em aquecimento; as primeiras leituras podem degradar ate o warm-up terminar."
     if backends.get("paddleocr") and backends.get("llm_fallback"):
         return "OCR estruturado pronto com PaddleOCR e fallback LLM."
@@ -1498,8 +1501,9 @@ class ReceiptServiceHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), ReceiptServiceHandler)
-    _start_paddle_warmup()
-    if PADDLE_OCR_ENABLE_WARMUP and PADDLE_OCR_STARTUP_GRACE_MS > 0 and _paddle_ocr_available():
+    if PADDLE_OCR_WARMUP_ON_STARTUP:
+        _start_paddle_warmup()
+    if PADDLE_OCR_WARMUP_ON_STARTUP and PADDLE_OCR_ENABLE_WARMUP and PADDLE_OCR_STARTUP_GRACE_MS > 0 and _paddle_ocr_available():
         _PADDLE_WARMUP_EVENT.wait(timeout=max(0, PADDLE_OCR_STARTUP_GRACE_MS) / 1000)
     print(f"[receipt_service] listening on http://{HOST}:{PORT}")
     try:
