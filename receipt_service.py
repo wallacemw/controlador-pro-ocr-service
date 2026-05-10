@@ -1066,6 +1066,7 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
 class OpenAIReceiptRequest:
     local_text: str
     image_b64: str
+    image_mime_type: str
     currency: str
     categories: List[str]
 
@@ -1171,7 +1172,7 @@ def llm_extract_receipt(payload: OpenAIReceiptRequest) -> Dict[str, Any]:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{payload.image_b64}", "detail": "auto"}}
+                    {"type": "image_url", "image_url": {"url": f"data:{payload.image_mime_type or 'image/jpeg'};base64,{payload.image_b64}", "detail": "auto"}}
                 ]
             }
         ]
@@ -1396,6 +1397,7 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
     strategy = str(payload.get("strategy") or "auto").strip().lower()
     local_text = str(payload.get("localText") or "")
     image_b64 = str(payload.get("imageBase64HQ") or payload.get("imageBase64") or "")
+    image_mime_type = str(payload.get("imageMimeType") or "image/jpeg").strip() or "image/jpeg"
     currency = str(payload.get("currency") or "EUR")
     categories = [str(item) for item in (payload.get("categories") or []) if str(item).strip()]
     pages_processed = int(payload.get("pagesProcessed") or 1)
@@ -1465,6 +1467,7 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             llm_result = llm_extract_receipt(OpenAIReceiptRequest(
                 local_text=local_text,
                 image_b64=image_b64,
+                image_mime_type=image_mime_type,
                 currency=currency,
                 categories=categories,
             ))
