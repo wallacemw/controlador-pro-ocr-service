@@ -82,6 +82,7 @@ PADDLE_OCR_USE_TEXTLINE_ORIENTATION = _env_flag("PADDLE_OCR_USE_TEXTLINE_ORIENTA
 PADDLE_OCR_TEXT_DETECTION_MODEL_NAME = (os.getenv("PADDLE_OCR_TEXT_DETECTION_MODEL_NAME", "PP-OCRv5_mobile_det") or "").strip()
 PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME = (os.getenv("PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME", "") or "").strip()
 PADDLE_OCR_STARTUP_GRACE_MS = int(os.getenv("PADDLE_OCR_STARTUP_GRACE_MS", "8000") or "8000")
+PADDLE_OCR_MAX_IMAGE_SIDE = int(os.getenv("PADDLE_OCR_MAX_IMAGE_SIDE", "1400") or "1400")
 SUPABASE_PROJECT_URL = os.getenv("SUPABASE_PROJECT_URL", "https://zphgusvzgbznljqpozab.supabase.co").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_0GdmO02259hS8KydGNHCsw_JF1t5vG6").strip()
 ABLY_APP_NAMESPACE = os.getenv("ABLY_APP_NAMESPACE", "controlador-gastos-pro")
@@ -914,23 +915,36 @@ def _build_ocr_variants(image: Any) -> List[tuple[str, Any]]:
         oriented = ImageOps.exif_transpose(image) if ImageOps is not None else image
     except Exception:
         oriented = image
-    if oriented is not image:
-        variants[0] = ("original", oriented)
+    base = oriented
     try:
-        gray = ImageOps.grayscale(oriented) if ImageOps is not None else oriented.convert("L")
+        longest_side = max(int(base.width or 0), int(base.height or 0))
+        if PADDLE_OCR_MAX_IMAGE_SIDE > 0 and longest_side > PADDLE_OCR_MAX_IMAGE_SIDE:
+            scale = PADDLE_OCR_MAX_IMAGE_SIDE / float(longest_side)
+            target = (
+                max(1, int(round(base.width * scale))),
+                max(1, int(round(base.height * scale))),
+            )
+            resample = _resample_lanczos()
+            base = base.resize(target, resample) if resample is not None else base.resize(target)
+    except Exception:
+        base = oriented
+    variants[0] = ("original", base)
+    try:
+        gray = ImageOps.grayscale(base) if ImageOps is not None else base.convert("L")
         auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
         variants.append(("autocontrast", auto.convert("RGB")))
-        resample = _resample_lanczos()
-        if resample is not None:
-            upscaled = auto.resize((max(1, auto.width * 2), max(1, auto.height * 2)), resample)
-        else:
-            upscaled = auto.resize((max(1, auto.width * 2), max(1, auto.height * 2)))
-        if ImageEnhance is not None:
-            upscaled = ImageEnhance.Contrast(upscaled).enhance(1.35)
-            upscaled = ImageEnhance.Sharpness(upscaled).enhance(1.7)
-        if ImageFilter is not None:
-            upscaled = upscaled.filter(ImageFilter.SHARPEN)
-        variants.append(("upscaled", upscaled.convert("RGB")))
+        if max(auto.width, auto.height) <= 1000:
+            resample = _resample_lanczos()
+            if resample is not None:
+                upscaled = auto.resize((max(1, auto.width * 2), max(1, auto.height * 2)), resample)
+            else:
+                upscaled = auto.resize((max(1, auto.width * 2), max(1, auto.height * 2)))
+            if ImageEnhance is not None:
+                upscaled = ImageEnhance.Contrast(upscaled).enhance(1.35)
+                upscaled = ImageEnhance.Sharpness(upscaled).enhance(1.7)
+            if ImageFilter is not None:
+                upscaled = upscaled.filter(ImageFilter.SHARPEN)
+            variants.append(("upscaled", upscaled.convert("RGB")))
     except Exception:
         pass
     return variants
@@ -1006,7 +1020,7 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
     best_score = -1.0
     for _, variant in _build_ocr_variants(image):
         try:
-            result = ocr.ocr(_image_to_ocr_input(variant))
+            result = ocr.ocr(_image_to_ocr_input(variant), cls=False)
         except Exception:
             continue
         text, blocks = _extract_paddle_text(result)
