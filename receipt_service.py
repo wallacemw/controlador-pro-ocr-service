@@ -947,20 +947,9 @@ def _get_paddle_ocr():
             _mark_paddle_warmup_state("warming", started_at=started_at)
             try:
                 _PADDLE_OCR = paddle_ocr_class(**_build_paddle_ocr_kwargs())
-                _warm_paddle_ocr(_PADDLE_OCR)
                 _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
             except Exception as err:
                 _PADDLE_OCR = None
-                _PADDLE_IMPORT_ERROR = str(err)
-                _mark_paddle_warmup_state("error", error=str(err), started_at=started_at, finished_at=time.time())
-                raise
-        elif _PADDLE_WARMUP_STATE != "ready":
-            started_at = _PADDLE_WARMUP_STARTED_AT or time.time()
-            _mark_paddle_warmup_state("warming", started_at=started_at)
-            try:
-                _warm_paddle_ocr(_PADDLE_OCR)
-                _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
-            except Exception as err:
                 _PADDLE_IMPORT_ERROR = str(err)
                 _mark_paddle_warmup_state("error", error=str(err), started_at=started_at, finished_at=time.time())
                 raise
@@ -978,7 +967,9 @@ def _start_paddle_warmup() -> None:
 
     def _runner() -> None:
         try:
-            _get_paddle_ocr()
+            ocr = _get_paddle_ocr()
+            if ocr is not None:
+                _warm_paddle_ocr(ocr)
         except Exception as err:
             print(f"[receipt_service] paddle warmup failed: {err}", file=sys.stderr)
 
