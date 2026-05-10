@@ -67,9 +67,8 @@ OCR_SERVICE_UPSTREAM_URL = os.getenv("OCR_SERVICE_UPSTREAM_URL", "").strip().rst
 OCR_SERVICE_UPSTREAM_TIMEOUT_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_TIMEOUT_MS", "25000") or "25000")
 OCR_SERVICE_SHARED_SECRET = os.getenv("OCR_SERVICE_SHARED_SECRET", "").strip()
 OCR_SERVICE_ENFORCE_SHARED_SECRET = _env_flag("OCR_SERVICE_ENFORCE_SHARED_SECRET", False)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_RECEIPT_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 OCR_LANG = os.getenv("RECEIPT_OCR_LANG", "pt")
 PADDLE_OCR_ENABLE_WARMUP = _env_flag("PADDLE_OCR_ENABLE_WARMUP", True)
 PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY = _env_flag("PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY", False)
@@ -753,7 +752,7 @@ def _should_try_image_only_llm_recovery(
     ocr_text_length: int,
     ocr_blocks_count: int,
 ) -> bool:
-    if not OPENAI_API_KEY or not image_b64:
+    if not GEMINI_API_KEY or not image_b64:
         return False
     if str(local_text or "").strip():
         return False
@@ -1062,8 +1061,93 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
     return best_text, best_blocks
 
 
+def _build_receipt_llm_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "store": {"type": ["string", "null"]},
+            "date": {"type": ["string", "null"]},
+            "taxId": {"type": ["string", "null"]},
+            "paymentMethod": {"type": ["string", "null"]},
+            "subtotal": {"type": "number"},
+            "grandTotal": {"type": "number"},
+            "discounts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "amount": {"type": "number"}
+                    },
+                    "required": ["description", "amount"],
+                    "additionalProperties": False
+                }
+            },
+            "fees": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "amount": {"type": "number"}
+                    },
+                    "required": ["description", "amount"],
+                    "additionalProperties": False
+                }
+            },
+            "taxes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "rate": {"type": "number"},
+                        "taxable": {"type": "number"},
+                        "amount": {"type": "number"}
+                    },
+                    "required": ["label", "rate", "taxable", "amount"],
+                    "additionalProperties": False
+                }
+            },
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "qty": {"type": "number"},
+                        "unitPrice": {"type": "number"},
+                        "lineTotal": {"type": "number"},
+                        "category": {"type": "string"},
+                        "confidence": {"type": "number"}
+                    },
+                    "required": ["description", "qty", "unitPrice", "lineTotal", "category", "confidence"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["store", "date", "taxId", "paymentMethod", "subtotal", "grandTotal", "discounts", "fees", "taxes", "items"],
+        "additionalProperties": False
+    }
+
+
+def _extract_gemini_json_text(data: Dict[str, Any]) -> str:
+    candidates = data.get("candidates") or []
+    content = candidates[0].get("content") if candidates and isinstance(candidates[0], dict) else {}
+    parts = content.get("parts") if isinstance(content, dict) else []
+    chunks: List[str] = []
+    for part in parts or []:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            chunks.append(part["text"])
+    raw = "\n".join(chunks).strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    return raw.strip()
+
+
 @dataclass
-class OpenAIReceiptRequest:
+class GeminiReceiptRequest:
     local_text: str
     image_b64: str
     image_mime_type: str
@@ -1071,80 +1155,10 @@ class OpenAIReceiptRequest:
     categories: List[str]
 
 
-def llm_extract_receipt(payload: OpenAIReceiptRequest) -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY não configurada no serviço.")
-    schema = {
-        "name": "receipt_extraction",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "store": {"type": ["string", "null"]},
-                "date": {"type": ["string", "null"]},
-                "taxId": {"type": ["string", "null"]},
-                "paymentMethod": {"type": ["string", "null"]},
-                "subtotal": {"type": "number"},
-                "grandTotal": {"type": "number"},
-                "discounts": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string"},
-                            "amount": {"type": "number"}
-                        },
-                        "required": ["description", "amount"],
-                        "additionalProperties": False
-                    }
-                },
-                "fees": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string"},
-                            "amount": {"type": "number"}
-                        },
-                        "required": ["description", "amount"],
-                        "additionalProperties": False
-                    }
-                },
-                "taxes": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string"},
-                            "rate": {"type": "number"},
-                            "taxable": {"type": "number"},
-                            "amount": {"type": "number"}
-                        },
-                        "required": ["label", "rate", "taxable", "amount"],
-                        "additionalProperties": False
-                    }
-                },
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string"},
-                            "qty": {"type": "number"},
-                            "unitPrice": {"type": "number"},
-                            "lineTotal": {"type": "number"},
-                            "category": {"type": "string"},
-                            "confidence": {"type": "number"}
-                        },
-                        "required": ["description", "qty", "unitPrice", "lineTotal", "category", "confidence"],
-                        "additionalProperties": False
-                    }
-                }
-            },
-            "required": ["store", "date", "taxId", "paymentMethod", "subtotal", "grandTotal", "discounts", "fees", "taxes", "items"],
-            "additionalProperties": False
-        }
-    }
+def llm_extract_receipt(payload: GeminiReceiptRequest) -> Dict[str, Any]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY não configurada no serviço.")
+    schema = _build_receipt_llm_schema()
 
     instruction = (
         "Extraia dados fiscais de um recibo. "
@@ -1158,31 +1172,44 @@ def llm_extract_receipt(payload: OpenAIReceiptRequest) -> Dict[str, Any]:
         "Retorne somente dados fiéis ao documento.\n\n"
         f"OCR bruto:\n{payload.local_text or '[vazio]'}"
     )
+    parts: List[Dict[str, Any]] = [{
+        "text": (
+            f"{instruction}\n\n"
+            "Responda apenas com JSON válido aderente ao schema pedido.\n\n"
+            f"{user_text}"
+        )
+    }]
+    if payload.image_b64:
+        parts.append({
+            "inline_data": {
+                "mime_type": payload.image_mime_type or "image/jpeg",
+                "data": payload.image_b64
+            }
+        })
     body = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.05,
-        "max_completion_tokens": 1800,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": schema
-        },
-        "messages": [
-            {"role": "system", "content": instruction},
+        "contents": [
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": f"data:{payload.image_mime_type or 'image/jpeg'};base64,{payload.image_b64}", "detail": "auto"}}
-                ]
+                "parts": parts
             }
-        ]
+        ],
+        "generationConfig": {
+            "temperature": 0.05,
+            "maxOutputTokens": 1800,
+            "responseMimeType": "application/json",
+            "responseJsonSchema": schema
+        }
     }
+    generate_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{urllib.parse.quote(GEMINI_MODEL, safe='.-')}:generateContent"
+    )
     req = urllib.request.Request(
-        OPENAI_CHAT_URL,
+        generate_url,
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}"
+            "x-goog-api-key": GEMINI_API_KEY
         },
         method="POST"
     )
@@ -1191,15 +1218,17 @@ def llm_extract_receipt(payload: OpenAIReceiptRequest) -> Dict[str, Any]:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
         body = err.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"OpenAI HTTP {err.code}: {body[:220]}")
+        raise RuntimeError(f"Gemini HTTP {err.code}: {body[:220]}")
     except Exception as err:
-        raise RuntimeError(f"OpenAI indisponível: {err}")
+        raise RuntimeError(f"Gemini indisponível: {err}")
 
-    raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    raw_content = _extract_gemini_json_text(data)
+    if not raw_content:
+        raise RuntimeError("Gemini não devolveu conteúdo estruturado.")
     try:
         parsed = json.loads(raw_content)
     except Exception as err:
-        raise RuntimeError(f"Structured output inválido: {err}")
+        raise RuntimeError(f"Structured output Gemini inválido: {err}")
     result = parse_receipt_text(payload.local_text or "", source="service_llm")
     result.update({
         "store": (parsed.get("store") or result.get("store") or "").strip(),
@@ -1221,6 +1250,8 @@ def llm_extract_receipt(payload: OpenAIReceiptRequest) -> Dict[str, Any]:
         **result.get("diagnostics", {}),
         "layoutAmbiguous": False,
         "itemSectionMissing": len(result.get("items") or []) == 0,
+        "llmProvider": "gemini",
+        "llmModel": GEMINI_MODEL,
     }
     return result
 
@@ -1229,8 +1260,8 @@ def build_backend_flags() -> Dict[str, Any]:
     return {
         "parser": True,
         "paddleocr": _paddle_ocr_available(),
-        "llm_fallback": bool(OPENAI_API_KEY),
-        "openai": bool(OPENAI_API_KEY),
+        "llm_fallback": bool(GEMINI_API_KEY),
+        "gemini": bool(GEMINI_API_KEY),
         "paddle_ready": _PADDLE_WARMUP_STATE == "ready",
     }
 
@@ -1287,8 +1318,8 @@ def build_health_payload() -> Dict[str, Any]:
                 backends = {
                     "parser": upstream_backends.get("parser") is not False,
                     "paddleocr": bool(upstream_backends.get("paddleocr")),
-                    "llm_fallback": bool(upstream_backends.get("llm_fallback") or upstream_backends.get("openai")),
-                    "openai": bool(upstream_backends.get("openai")),
+                    "llm_fallback": bool(upstream_backends.get("llm_fallback") or upstream_backends.get("gemini")),
+                    "gemini": bool(upstream_backends.get("gemini")),
                 }
                 mode = str(upstream.get("mode") or _build_receipt_mode(backends))
             details = {
@@ -1309,7 +1340,7 @@ def build_health_payload() -> Dict[str, Any]:
                 "parser": True,
                 "paddleocr": False,
                 "llm_fallback": False,
-                "openai": False,
+                "gemini": False,
             }
             mode = "parser_service"
             details = {
@@ -1422,8 +1453,8 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                     backends = {
                         "parser": upstream_backends.get("parser") is not False,
                         "paddleocr": bool(upstream_backends.get("paddleocr")),
-                        "llm_fallback": bool(upstream_backends.get("llm_fallback") or upstream_backends.get("openai")),
-                        "openai": bool(upstream_backends.get("openai")),
+                        "llm_fallback": bool(upstream_backends.get("llm_fallback") or upstream_backends.get("gemini")),
+                        "gemini": bool(upstream_backends.get("gemini")),
                     }
                     mode = str(upstream.get("mode") or _build_receipt_mode(backends))
                 upstream_result = upstream.get("result")
@@ -1455,7 +1486,7 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                     best_result = ocr_result
                     local_text = ocr_text
 
-        should_try_llm = strategy in {"llm", "auto"} and image_b64 and OPENAI_API_KEY and _needs_llm(best_result)
+        should_try_llm = strategy in {"llm", "auto"} and image_b64 and GEMINI_API_KEY and _needs_llm(best_result)
         should_try_image_only_llm = _should_try_image_only_llm_recovery(
             local_text=local_text,
             image_b64=image_b64,
@@ -1464,7 +1495,7 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             ocr_blocks_count=ocr_blocks_count,
         )
         if should_try_llm or should_try_image_only_llm:
-            llm_result = llm_extract_receipt(OpenAIReceiptRequest(
+            llm_result = llm_extract_receipt(GeminiReceiptRequest(
                 local_text=local_text,
                 image_b64=image_b64,
                 image_mime_type=image_mime_type,

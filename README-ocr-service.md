@@ -42,7 +42,7 @@ O caminho mais simples nesta fase é usar a [Render com web services Docker](htt
 4. Configure o secret:
    - `OCR_SERVICE_SHARED_SECRET`
 5. Opcionalmente configure:
-   - `OPENAI_API_KEY`
+   - `GEMINI_API_KEY`
 6. Faça o deploy.
 
 Depois do deploy, guarde a URL pública do OCR dedicado, por exemplo:
@@ -56,7 +56,8 @@ Configure no serviço OCR:
 - `RECEIPT_SERVICE_HOST=0.0.0.0`
 - `RECEIPT_SERVICE_PORT=10000`
 - `RECEIPT_OCR_LANG=pt`
-- `OPENAI_API_KEY=` opcional
+- `GEMINI_API_KEY=` opcional
+- `GEMINI_RECEIPT_MODEL=gemini-2.5-flash`
 - `OCR_SERVICE_SHARED_SECRET=uma-chave-forte`
 - `OCR_SERVICE_ENFORCE_SHARED_SECRET=1`
 - `PADDLE_OCR_ENABLE_WARMUP=1`
