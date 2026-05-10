@@ -929,6 +929,13 @@ def _build_ocr_variants(image: Any) -> List[tuple[str, Any]]:
         gray = ImageOps.grayscale(base) if ImageOps is not None else base.convert("L")
         auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
         variants.append(("autocontrast", auto.convert("RGB")))
+        try:
+            binary = auto.point(lambda px: 255 if px > 168 else 0, mode="1").convert("RGB")
+            variants.append(("binary", binary))
+            if ImageOps is not None:
+                variants.append(("binary_padded", ImageOps.expand(binary, border=24, fill="white")))
+        except Exception:
+            pass
         if max(auto.width, auto.height) <= 1000:
             resample = _resample_lanczos()
             if resample is not None:
@@ -1382,6 +1389,9 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
         local_result = parse_receipt_text(local_text, source="service_ocr", pages_processed=pages_processed) if local_text else None
         best_result = local_result
         upstream_error = ""
+        ocr_text_preview = ""
+        ocr_text_length = 0
+        ocr_blocks_count = 0
 
         if _upstream_proxy_enabled() and image_b64:
             try:
@@ -1416,6 +1426,9 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
         )
         if _paddle_ocr_available() and image_b64 and should_run_paddle:
             ocr_text, blocks = ocr_with_paddle(image_b64)
+            ocr_text_length = len(ocr_text or "")
+            ocr_blocks_count = len(blocks or [])
+            ocr_text_preview = "\n".join([line for line in str(ocr_text or "").splitlines()[:12] if line.strip()])[:700]
             if ocr_text.strip():
                 ocr_result = parse_receipt_text(ocr_text, source="service_ocr", pages_processed=pages_processed)
                 ocr_result["diagnostics"]["ocrBlocks"] = len(blocks)
@@ -1466,6 +1479,11 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             details={
                 "message": str(err) or "A leitura do recibo falhou nesta tentativa.",
                 "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
+                "ocrDiagnostics": {
+                    "textLength": ocr_text_length,
+                    "blockCount": ocr_blocks_count,
+                    "preview": ocr_text_preview,
+                },
             },
             backends=backends,
         )
