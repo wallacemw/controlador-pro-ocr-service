@@ -17,7 +17,7 @@ services:
       - key: PADDLE_OCR_ENABLE_WARMUP
         value: "1"
       - key: PADDLE_OCR_STARTUP_GRACE_MS
-        value: "8000"
+        value: "15000"
       - key: PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY
         value: "0"
       - key: PADDLE_OCR_USE_DOC_UNWARPING

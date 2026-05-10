@@ -64,7 +64,7 @@ HOST = os.getenv("RECEIPT_SERVICE_HOST", "127.0.0.1")
 PORT = int(os.getenv("RECEIPT_SERVICE_PORT", "8787"))
 RUNNING_ON_VERCEL = bool(os.getenv("VERCEL"))
 OCR_SERVICE_UPSTREAM_URL = os.getenv("OCR_SERVICE_UPSTREAM_URL", "").strip().rstrip("/")
-OCR_SERVICE_UPSTREAM_TIMEOUT_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_TIMEOUT_MS", "25000") or "25000")
+OCR_SERVICE_UPSTREAM_TIMEOUT_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_TIMEOUT_MS", "45000") or "45000")
 OCR_SERVICE_SHARED_SECRET = os.getenv("OCR_SERVICE_SHARED_SECRET", "").strip()
 OCR_SERVICE_ENFORCE_SHARED_SECRET = _env_flag("OCR_SERVICE_ENFORCE_SHARED_SECRET", False)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -91,6 +91,7 @@ _PADDLE_OCR_CLASS = None
 _PADDLE_IMPORT_ATTEMPTED = False
 _PADDLE_IMPORT_ERROR = ""
 _PADDLE_OCR_LOCK = threading.Lock()
+_PADDLE_OCR_RUN_LOCK = threading.Lock()
 _PADDLE_WARMUP_EVENT = threading.Event()
 _PADDLE_WARMUP_THREAD = None
 _PADDLE_WARMUP_STATE = "idle"
@@ -860,9 +861,14 @@ def _warm_paddle_ocr(ocr: Any) -> None:
     if warm_image is None:
         return
     try:
-        _run_paddle_ocr(ocr, warm_image)
+        with _PADDLE_OCR_RUN_LOCK:
+            _run_paddle_ocr(ocr, warm_image)
     except Exception as err:
         raise RuntimeError(f"Falha ao aquecer PaddleOCR: {err}") from err
+
+
+def _paddle_warmup_in_progress() -> bool:
+    return _PADDLE_WARMUP_STATE in {"initializing", "warming"}
 
 
 def _ocr_has_signal(text: str, blocks: List[Any]) -> bool:
@@ -999,10 +1005,12 @@ def _get_paddle_ocr():
         if _PADDLE_OCR is None:
             _PADDLE_WARMUP_EVENT.clear()
             started_at = time.time()
-            _mark_paddle_warmup_state("warming", started_at=started_at)
+            next_state = "initializing" if PADDLE_OCR_ENABLE_WARMUP else "warming"
+            _mark_paddle_warmup_state(next_state, started_at=started_at)
             try:
                 _PADDLE_OCR = paddle_ocr_class(**_build_paddle_ocr_kwargs())
-                _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
+                if not PADDLE_OCR_ENABLE_WARMUP:
+                    _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
             except Exception as err:
                 _PADDLE_OCR = None
                 _PADDLE_IMPORT_ERROR = str(err)
@@ -1024,7 +1032,9 @@ def _start_paddle_warmup() -> None:
         try:
             ocr = _get_paddle_ocr()
             if ocr is not None:
+                _mark_paddle_warmup_state("warming", started_at=_PADDLE_WARMUP_STARTED_AT or time.time())
                 _warm_paddle_ocr(ocr)
+                _mark_paddle_warmup_state("ready", started_at=_PADDLE_WARMUP_STARTED_AT or time.time(), finished_at=time.time())
         except Exception as err:
             print(f"[receipt_service] paddle warmup failed: {err}", file=sys.stderr)
 
@@ -1047,7 +1057,8 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
     best_score = -1.0
     for _, variant in _build_ocr_variants(image):
         try:
-            result = _run_paddle_ocr(ocr, variant)
+            with _PADDLE_OCR_RUN_LOCK:
+                result = _run_paddle_ocr(ocr, variant)
         except Exception:
             continue
         text, blocks = _extract_paddle_text(result)
@@ -1058,6 +1069,8 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
             best_blocks = blocks
         if candidate_score >= 4.2 and _ocr_has_signal(text, blocks):
             break
+    if best_score >= 0 and _PADDLE_WARMUP_STATE in {"initializing", "warming"}:
+        _mark_paddle_warmup_state("ready", started_at=_PADDLE_WARMUP_STARTED_AT or time.time(), finished_at=time.time())
     return best_text, best_blocks
 
 
@@ -1442,6 +1455,10 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
         ocr_text_preview = ""
         ocr_text_length = 0
         ocr_blocks_count = 0
+        paddle_warmup_deferred = False
+
+        if image_b64 and PADDLE_OCR_ENABLE_WARMUP:
+            _start_paddle_warmup()
 
         if _upstream_proxy_enabled() and image_b64:
             try:
@@ -1474,6 +1491,9 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             or best_result is None
             or (strategy == "auto" and _needs_llm(best_result))
         )
+        if should_run_paddle and _paddle_warmup_in_progress() and strategy != "ocr" and GEMINI_API_KEY:
+            should_run_paddle = False
+            paddle_warmup_deferred = True
         if _paddle_ocr_available() and image_b64 and should_run_paddle:
             ocr_text, blocks = ocr_with_paddle(image_b64)
             ocr_text_length = len(ocr_text or "")
@@ -1507,6 +1527,12 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                 best_result.setdefault("diagnostics", {})
                 if should_try_image_only_llm:
                     best_result["diagnostics"]["imageOnlyLlmRecovery"] = True
+                if paddle_warmup_deferred:
+                    best_result["diagnostics"]["paddleWarmupDeferred"] = True
+
+        if best_result is not None and paddle_warmup_deferred:
+            best_result.setdefault("diagnostics", {})
+            best_result["diagnostics"]["paddleWarmupDeferred"] = True
 
         if best_result is None:
             raise RuntimeError("Nenhum backend conseguiu estruturar o recibo.")
@@ -1545,6 +1571,8 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                     "textLength": ocr_text_length,
                     "blockCount": ocr_blocks_count,
                     "preview": ocr_text_preview,
+                    "paddleState": _PADDLE_WARMUP_STATE,
+                    "paddleWarmupDeferred": paddle_warmup_deferred,
                 },
             },
             backends=backends,

@@ -61,7 +61,7 @@ Configure no serviço OCR:
 - `OCR_SERVICE_SHARED_SECRET=uma-chave-forte`
 - `OCR_SERVICE_ENFORCE_SHARED_SECRET=1`
 - `PADDLE_OCR_ENABLE_WARMUP=1`
-- `PADDLE_OCR_STARTUP_GRACE_MS=8000`
+- `PADDLE_OCR_STARTUP_GRACE_MS=15000`
 - `PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY=0`
 - `PADDLE_OCR_USE_DOC_UNWARPING=0`
 - `PADDLE_OCR_USE_TEXTLINE_ORIENTATION=0`
@@ -74,7 +74,7 @@ Esses defaults reduzem o cold start e aquecem o PaddleOCR antes da primeira leit
 Configure na Vercel:
 
 - `OCR_SERVICE_UPSTREAM_URL=https://seu-ocr-dedicado.exemplo.com`
-- `OCR_SERVICE_UPSTREAM_TIMEOUT_MS=25000`
+- `OCR_SERVICE_UPSTREAM_TIMEOUT_MS=45000`
 - `OCR_SERVICE_SHARED_SECRET=mesma-chave-forte`
 
 Não ative `OCR_SERVICE_ENFORCE_SHARED_SECRET` na Vercel; ele é usado no serviço OCR dedicado.
