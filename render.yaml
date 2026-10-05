@@ -33,7 +33,7 @@ services:
       - key: OCR_SERVICE_RATE_LIMIT_PER_MINUTE
         value: "60"
       - key: OCR_SERVICE_CORS_ORIGINS
-        value: "*"
+        value: "https://controlador-gastos-pro.vercel.app"
       - key: OCR_SERVICE_SHARED_SECRET
         sync: false
       - key: GEMINI_API_KEY
