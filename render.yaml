@@ -3,7 +3,7 @@ services:
     name: controlador-pro-ocr
     runtime: docker
     plan: starter
-    dockerfilePath: ./Dockerfile.ocr
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     autoDeployTrigger: commit
     healthCheckPath: /health
