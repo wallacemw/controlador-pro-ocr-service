@@ -1,0 +1,26 @@
+name: OCR service integrity
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Python syntax
+        run: python -m py_compile receipt_service.py
+      - name: Render contract
+        run: |
+          test -f Dockerfile
+          grep -F "dockerfilePath: ./Dockerfile" render.yaml
+          ! grep -F "zphgusvzgbznljqpozab" receipt_service.py
+          ! grep -F "sb_publishable_0GdmO02259hS8KydGNHCsw_JF1t5vG6" receipt_service.py
