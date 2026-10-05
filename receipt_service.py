@@ -65,6 +65,8 @@ PORT = int(os.getenv("RECEIPT_SERVICE_PORT", "8787"))
 RUNNING_ON_VERCEL = bool(os.getenv("VERCEL"))
 OCR_SERVICE_UPSTREAM_URL = os.getenv("OCR_SERVICE_UPSTREAM_URL", "").strip().rstrip("/")
 OCR_SERVICE_UPSTREAM_TIMEOUT_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_TIMEOUT_MS", "45000") or "45000")
+OCR_SERVICE_UPSTREAM_HEALTH_TIMEOUT_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_HEALTH_TIMEOUT_MS", "8000") or "8000")
+OCR_SERVICE_UPSTREAM_HEALTH_CACHE_TTL_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_HEALTH_CACHE_TTL_MS", "180000") or "180000")
 OCR_SERVICE_SHARED_SECRET = os.getenv("OCR_SERVICE_SHARED_SECRET", "").strip()
 OCR_SERVICE_ENFORCE_SHARED_SECRET = _env_flag("OCR_SERVICE_ENFORCE_SHARED_SECRET", False)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -78,8 +80,8 @@ PADDLE_OCR_TEXT_DETECTION_MODEL_NAME = (os.getenv("PADDLE_OCR_TEXT_DETECTION_MOD
 PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME = (os.getenv("PADDLE_OCR_TEXT_RECOGNITION_MODEL_NAME", "") or "").strip()
 PADDLE_OCR_STARTUP_GRACE_MS = int(os.getenv("PADDLE_OCR_STARTUP_GRACE_MS", "8000") or "8000")
 PADDLE_OCR_MAX_IMAGE_SIDE = int(os.getenv("PADDLE_OCR_MAX_IMAGE_SIDE", "1400") or "1400")
-SUPABASE_PROJECT_URL = os.getenv("SUPABASE_PROJECT_URL", "https://zphgusvzgbznljqpozab.supabase.co").rstrip("/")
-SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_0GdmO02259hS8KydGNHCsw_JF1t5vG6").strip()
+SUPABASE_PROJECT_URL = os.getenv("SUPABASE_PROJECT_URL", "").rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
 ABLY_APP_NAMESPACE = os.getenv("ABLY_APP_NAMESPACE", "controlador-gastos-pro")
 ABLY_TOKEN_TTL_MS = int(os.getenv("ABLY_TOKEN_TTL_MS", "3600000") or "3600000")
 ABLY_PREFERRED_KEY_NAME = os.getenv("ABLY_PREFERRED_KEY_NAME", "7Y8Xrw.ReiTmw").strip()
@@ -91,7 +93,6 @@ _PADDLE_OCR_CLASS = None
 _PADDLE_IMPORT_ATTEMPTED = False
 _PADDLE_IMPORT_ERROR = ""
 _PADDLE_OCR_LOCK = threading.Lock()
-_PADDLE_OCR_RUN_LOCK = threading.Lock()
 _PADDLE_WARMUP_EVENT = threading.Event()
 _PADDLE_WARMUP_THREAD = None
 _PADDLE_WARMUP_STATE = "idle"
@@ -99,6 +100,13 @@ _PADDLE_WARMUP_ERROR = ""
 _PADDLE_WARMUP_DURATION_MS = 0
 _PADDLE_WARMUP_STARTED_AT = 0.0
 _PADDLE_WARMUP_FINISHED_AT = 0.0
+_UPSTREAM_HEALTH_CACHE: Dict[str, Any] = {
+    "payload": None,
+    "checked_at": 0.0,
+    "last_success_at": "",
+    "last_failure_at": "",
+    "last_error": "",
+}
 
 
 def _send_cors_headers(handler: BaseHTTPRequestHandler) -> None:
@@ -137,6 +145,13 @@ def _response_payload(ok: bool, service: str, *, error: str = "", mode: str = ""
         payload["details"] = details
     payload.update(extra)
     return payload
+
+
+def _clone_json_like(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except Exception:
+        return value
 
 
 def build_error_payload(service: str, error: str, *, mode: str = "", details: Optional[Dict[str, Any]] = None, **extra: Any) -> Dict[str, Any]:
@@ -207,6 +222,63 @@ def _call_upstream_json(path: str, *, method: str = "GET", payload: Optional[Dic
         setattr(error, "status_code", getattr(err, "status_code", 0))
         setattr(error, "error_code", getattr(err, "error_code", "upstream_error"))
         raise error
+
+
+def _cache_upstream_health(payload: Dict[str, Any]) -> None:
+    _UPSTREAM_HEALTH_CACHE["payload"] = _clone_json_like(payload)
+    _UPSTREAM_HEALTH_CACHE["checked_at"] = time.time()
+    _UPSTREAM_HEALTH_CACHE["last_success_at"] = str(payload.get("timestamp") or _iso_now())
+    _UPSTREAM_HEALTH_CACHE["last_error"] = ""
+
+
+def _mark_upstream_health_failure(message: str) -> None:
+    _UPSTREAM_HEALTH_CACHE["last_failure_at"] = _iso_now()
+    _UPSTREAM_HEALTH_CACHE["last_error"] = str(message or "")
+
+
+def _get_cached_upstream_health() -> Optional[Dict[str, Any]]:
+    payload = _UPSTREAM_HEALTH_CACHE.get("payload")
+    checked_at = float(_UPSTREAM_HEALTH_CACHE.get("checked_at") or 0.0)
+    if not payload or not checked_at:
+        return None
+    age_ms = int(max(0.0, time.time() - checked_at) * 1000)
+    if age_ms > max(0, OCR_SERVICE_UPSTREAM_HEALTH_CACHE_TTL_MS):
+        return None
+    cached = _clone_json_like(payload)
+    if isinstance(cached, dict):
+        cached["_cache_age_ms"] = age_ms
+    return cached if isinstance(cached, dict) else None
+
+
+def _build_proxy_details(*, enabled: bool, active: bool, cached: bool = False, upstream_payload: Optional[Dict[str, Any]] = None, upstream_error: str = "") -> Dict[str, Any]:
+    payload = upstream_payload or {}
+    return {
+        "enabled": bool(enabled),
+        "upstream": OCR_SERVICE_UPSTREAM_URL if enabled else "",
+        "active": bool(active),
+        "cached": bool(cached),
+        "upstream_timestamp": str(payload.get("timestamp") or ""),
+        "upstream_error": str(upstream_error or ""),
+        "health_timeout_ms": OCR_SERVICE_UPSTREAM_HEALTH_TIMEOUT_MS,
+        "parse_timeout_ms": OCR_SERVICE_UPSTREAM_TIMEOUT_MS,
+        "last_success_at": str(_UPSTREAM_HEALTH_CACHE.get("last_success_at") or payload.get("timestamp") or ""),
+        "last_failure_at": str(_UPSTREAM_HEALTH_CACHE.get("last_failure_at") or ""),
+        "last_error": str(_UPSTREAM_HEALTH_CACHE.get("last_error") or ""),
+        "cache_ttl_ms": OCR_SERVICE_UPSTREAM_HEALTH_CACHE_TTL_MS,
+        "cache_age_ms": int(payload.get("_cache_age_ms") or 0),
+    }
+
+
+def _probe_upstream_health_quick() -> Optional[Dict[str, Any]]:
+    if not _upstream_proxy_enabled():
+        return None
+    try:
+        upstream = _call_upstream_json("/health", method="GET", timeout_ms=OCR_SERVICE_UPSTREAM_HEALTH_TIMEOUT_MS)
+        _cache_upstream_health(upstream)
+        return upstream
+    except Exception as err:
+        _mark_upstream_health_failure(str(err))
+        return _get_cached_upstream_health()
 
 
 def _parse_query(path: str) -> tuple[str, Dict[str, List[str]]]:
@@ -861,14 +933,9 @@ def _warm_paddle_ocr(ocr: Any) -> None:
     if warm_image is None:
         return
     try:
-        with _PADDLE_OCR_RUN_LOCK:
-            _run_paddle_ocr(ocr, warm_image)
+        _run_paddle_ocr(ocr, warm_image)
     except Exception as err:
         raise RuntimeError(f"Falha ao aquecer PaddleOCR: {err}") from err
-
-
-def _paddle_warmup_in_progress() -> bool:
-    return _PADDLE_WARMUP_STATE in {"initializing", "warming"}
 
 
 def _ocr_has_signal(text: str, blocks: List[Any]) -> bool:
@@ -951,13 +1018,6 @@ def _build_ocr_variants(image: Any) -> List[tuple[str, Any]]:
         gray = ImageOps.grayscale(base) if ImageOps is not None else base.convert("L")
         auto = ImageOps.autocontrast(gray) if ImageOps is not None else gray
         variants.append(("autocontrast", auto.convert("RGB")))
-        try:
-            binary = auto.point(lambda px: 255 if px > 168 else 0, mode="1").convert("RGB")
-            variants.append(("binary", binary))
-            if ImageOps is not None:
-                variants.append(("binary_padded", ImageOps.expand(binary, border=24, fill="white")))
-        except Exception:
-            pass
         if max(auto.width, auto.height) <= 1000:
             resample = _resample_lanczos()
             if resample is not None:
@@ -1005,12 +1065,10 @@ def _get_paddle_ocr():
         if _PADDLE_OCR is None:
             _PADDLE_WARMUP_EVENT.clear()
             started_at = time.time()
-            next_state = "initializing" if PADDLE_OCR_ENABLE_WARMUP else "warming"
-            _mark_paddle_warmup_state(next_state, started_at=started_at)
+            _mark_paddle_warmup_state("warming", started_at=started_at)
             try:
                 _PADDLE_OCR = paddle_ocr_class(**_build_paddle_ocr_kwargs())
-                if not PADDLE_OCR_ENABLE_WARMUP:
-                    _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
+                _mark_paddle_warmup_state("ready", started_at=started_at, finished_at=time.time())
             except Exception as err:
                 _PADDLE_OCR = None
                 _PADDLE_IMPORT_ERROR = str(err)
@@ -1032,9 +1090,7 @@ def _start_paddle_warmup() -> None:
         try:
             ocr = _get_paddle_ocr()
             if ocr is not None:
-                _mark_paddle_warmup_state("warming", started_at=_PADDLE_WARMUP_STARTED_AT or time.time())
                 _warm_paddle_ocr(ocr)
-                _mark_paddle_warmup_state("ready", started_at=_PADDLE_WARMUP_STARTED_AT or time.time(), finished_at=time.time())
         except Exception as err:
             print(f"[receipt_service] paddle warmup failed: {err}", file=sys.stderr)
 
@@ -1057,8 +1113,7 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
     best_score = -1.0
     for _, variant in _build_ocr_variants(image):
         try:
-            with _PADDLE_OCR_RUN_LOCK:
-                result = _run_paddle_ocr(ocr, variant)
+            result = _run_paddle_ocr(ocr, variant)
         except Exception:
             continue
         text, blocks = _extract_paddle_text(result)
@@ -1069,8 +1124,6 @@ def ocr_with_paddle(image_b64: str) -> tuple[str, list]:
             best_blocks = blocks
         if candidate_score >= 4.2 and _ocr_has_signal(text, blocks):
             break
-    if best_score >= 0 and _PADDLE_WARMUP_STATE in {"initializing", "warming"}:
-        _mark_paddle_warmup_state("ready", started_at=_PADDLE_WARMUP_STARTED_AT or time.time(), finished_at=time.time())
     return best_text, best_blocks
 
 
@@ -1269,6 +1322,92 @@ def llm_extract_receipt(payload: GeminiReceiptRequest) -> Dict[str, Any]:
     return result
 
 
+def normalise_extraction(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = dict(result or {})
+    items: List[Dict[str, Any]] = []
+    for item in payload.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        line_total = round(_num(item.get("lineTotal") or item.get("total") or 0), 2)
+        if line_total <= 0:
+            continue
+        qty = _round3(item.get("qty") or item.get("quantity") or 1)
+        unit_price = round(_num(item.get("unitPrice") or item.get("unit_price") or 0), 2)
+        if unit_price <= 0:
+            unit_price = round(line_total / max(qty or 1, 0.001), 2)
+        items.append({
+            "description": str(item.get("description") or item.get("name") or "").strip(),
+            "qty": qty if qty > 0 else 1.0,
+            "unitPrice": unit_price,
+            "lineTotal": line_total,
+            "category": str(item.get("category") or _guess_category(item.get("description") or item.get("name") or "")).strip() or "Outros",
+            "confidence": max(0.0, min(1.0, float(item.get("confidence") or 0.0))) if str(item.get("confidence") or "").strip() else 0.0,
+            "bbox": item.get("bbox"),
+        })
+
+    def _normalise_amount_rows(rows: Any, label_key: str = "description") -> List[Dict[str, Any]]:
+        normalised: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            amount = round(_num(row.get("amount") or 0), 2)
+            if amount <= 0:
+                continue
+            normalised.append({
+                label_key: str(row.get(label_key) or row.get("label") or row.get("description") or "").strip(),
+                "amount": amount,
+            })
+        return normalised
+
+    taxes: List[Dict[str, Any]] = []
+    for row in payload.get("taxes") or []:
+        if not isinstance(row, dict):
+            continue
+        amount = round(_num(row.get("amount") or 0), 2)
+        if amount <= 0:
+            continue
+        taxes.append({
+            "label": str(row.get("label") or row.get("description") or "").strip(),
+            "rate": round(_num(row.get("rate") or 0), 2),
+            "taxable": round(_num(row.get("taxable") or 0), 2),
+            "amount": amount,
+        })
+
+    subtotal = round(_num(payload.get("subtotal") or 0), 2)
+    grand_total = round(_num(payload.get("grandTotal") or payload.get("total") or 0), 2)
+    if grand_total <= 0 and subtotal > 0:
+        grand_total = subtotal
+    diagnostics = dict(payload.get("diagnostics") or {})
+    normalised = {
+        "store": str(payload.get("store") or "").strip(),
+        "date": str(payload.get("date") or "").strip(),
+        "taxId": payload.get("taxId") or None,
+        "paymentMethod": payload.get("paymentMethod") or None,
+        "items": items,
+        "subtotal": subtotal,
+        "discounts": _normalise_amount_rows(payload.get("discounts")),
+        "fees": _normalise_amount_rows(payload.get("fees")),
+        "taxes": taxes,
+        "grandTotal": grand_total,
+        "total": grand_total,
+        "confidence": max(0.0, min(1.0, float(payload.get("confidence") or 0.0))) if str(payload.get("confidence") or "").strip() else 0.0,
+        "needsReview": bool(payload.get("needsReview")),
+        "source": str(payload.get("source") or "service_ocr"),
+        "diagnostics": diagnostics,
+    }
+    if "mismatch" not in diagnostics:
+        diagnostics["mismatch"] = False
+    if "missingTotals" not in diagnostics:
+        diagnostics["missingTotals"] = grand_total <= 0
+    if "pagesProcessed" not in diagnostics:
+        diagnostics["pagesProcessed"] = 1
+    if "itemSectionMissing" not in diagnostics:
+        diagnostics["itemSectionMissing"] = len(items) == 0
+    if "layoutAmbiguous" not in diagnostics:
+        diagnostics["layoutAmbiguous"] = len(items) == 0
+    return normalised
+
+
 def build_backend_flags() -> Dict[str, Any]:
     return {
         "parser": True,
@@ -1277,6 +1416,26 @@ def build_backend_flags() -> Dict[str, Any]:
         "gemini": bool(GEMINI_API_KEY),
         "paddle_ready": _PADDLE_WARMUP_STATE == "ready",
     }
+
+
+def _merge_upstream_runtime_state(upstream_payload: Optional[Dict[str, Any]], fallback_backends: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+    payload = upstream_payload or {}
+    upstream_backends = payload.get("backends") or {}
+    if not upstream_backends:
+        base = dict(fallback_backends or {})
+        return base, str(payload.get("mode") or _build_receipt_mode(base))
+    merged = {
+        "parser": upstream_backends.get("parser") is not False,
+        "paddleocr": bool(upstream_backends.get("paddleocr")),
+        "llm_fallback": bool(upstream_backends.get("llm_fallback") or upstream_backends.get("gemini")),
+        "gemini": bool(upstream_backends.get("gemini")),
+        "paddle_ready": bool(
+            upstream_backends.get("paddle_ready")
+            or payload.get("details", {}).get("paddle_ready")
+            or payload.get("details", {}).get("paddle", {}).get("state") == "ready"
+        ),
+    }
+    return merged, str(payload.get("mode") or _build_receipt_mode(merged))
 
 
 def _build_receipt_mode(backends: Dict[str, Any]) -> str:
@@ -1321,52 +1480,65 @@ def build_health_payload() -> Dict[str, Any]:
         "message": _build_receipt_runtime_message(backends),
         "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
         "paddle": _paddle_warmup_details(),
+        "paddle_ready": bool(backends.get("paddle_ready")),
+        "proxy": _build_proxy_details(enabled=False, active=False),
     }
     service_up = True
     if _upstream_proxy_enabled():
         try:
-            upstream = _call_upstream_json("/health", method="GET", timeout_ms=min(OCR_SERVICE_UPSTREAM_TIMEOUT_MS, 4500))
-            upstream_backends = upstream.get("backends") or {}
-            if upstream_backends:
-                backends = {
-                    "parser": upstream_backends.get("parser") is not False,
-                    "paddleocr": bool(upstream_backends.get("paddleocr")),
-                    "llm_fallback": bool(upstream_backends.get("llm_fallback") or upstream_backends.get("gemini")),
-                    "gemini": bool(upstream_backends.get("gemini")),
-                }
-                mode = str(upstream.get("mode") or _build_receipt_mode(backends))
+            upstream = _call_upstream_json("/health", method="GET", timeout_ms=OCR_SERVICE_UPSTREAM_HEALTH_TIMEOUT_MS)
+            _cache_upstream_health(upstream)
+            backends, mode = _merge_upstream_runtime_state(upstream, backends)
             details = {
                 "severity": upstream.get("details", {}).get("severity") or ("ok" if backends.get("paddleocr") else "warn"),
                 "message": upstream.get("details", {}).get("message") or "OCR dedicado activo via upstream.",
                 "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
                 "paddle": upstream.get("details", {}).get("paddle") or {},
-                "proxy": {
-                    "enabled": True,
-                    "upstream": OCR_SERVICE_UPSTREAM_URL,
-                    "active": True,
-                    "upstream_timestamp": upstream.get("timestamp") or "",
-                },
+                "paddle_ready": bool(backends.get("paddle_ready")),
+                "proxy": _build_proxy_details(enabled=True, active=True, upstream_payload=upstream),
             }
             service_up = upstream.get("service_up", True) is not False
         except Exception as err:
-            backends = {
-                "parser": True,
-                "paddleocr": False,
-                "llm_fallback": False,
-                "gemini": False,
-            }
-            mode = "parser_service"
-            details = {
-                "severity": "warn",
-                "message": f"OCR dedicado indisponivel; fallback parser service hospedado activo. Motivo: {err}",
-                "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
-                "proxy": {
-                    "enabled": True,
-                    "upstream": OCR_SERVICE_UPSTREAM_URL,
-                    "active": False,
-                    "upstream_error": str(err),
-                },
-            }
+            _mark_upstream_health_failure(str(err))
+            cached_upstream = _get_cached_upstream_health()
+            if cached_upstream:
+                backends, mode = _merge_upstream_runtime_state(cached_upstream, backends)
+                cached_message = str(cached_upstream.get("details", {}).get("message") or "OCR dedicado activo via cache recente.")
+                details = {
+                    "severity": "warn" if str(err or "").strip() else (cached_upstream.get("details", {}).get("severity") or "ok"),
+                    "message": (
+                        f"{cached_message} O ultimo estado saudavel do upstream foi reaproveitado porque o probe rapido falhou agora: {err}"
+                        if str(err or "").strip()
+                        else cached_message
+                    ),
+                    "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
+                    "paddle": cached_upstream.get("details", {}).get("paddle") or {},
+                    "paddle_ready": bool(backends.get("paddle_ready")),
+                    "proxy": _build_proxy_details(
+                        enabled=True,
+                        active=True,
+                        cached=True,
+                        upstream_payload=cached_upstream,
+                        upstream_error=str(err),
+                    ),
+                }
+            else:
+                backends = {
+                    "parser": True,
+                    "paddleocr": False,
+                    "llm_fallback": False,
+                    "gemini": False,
+                    "paddle_ready": False,
+                }
+                mode = "parser_service"
+                details = {
+                    "severity": "warn",
+                    "message": f"OCR dedicado configurado, mas indisponivel nesta verificacao; fallback parser service hospedado activo. Motivo: {err}",
+                    "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
+                    "paddle": {},
+                    "paddle_ready": False,
+                    "proxy": _build_proxy_details(enabled=True, active=False, upstream_error=str(err)),
+                }
             service_up = True
     return _response_payload(
         True,
@@ -1447,6 +1619,9 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
     pages_processed = int(payload.get("pagesProcessed") or 1)
     backends = build_backend_flags()
     mode = _build_receipt_mode(backends)
+    proxy_health = _get_cached_upstream_health() if _upstream_proxy_enabled() else None
+    if proxy_health:
+        backends, mode = _merge_upstream_runtime_state(proxy_health, backends)
 
     try:
         local_result = parse_receipt_text(local_text, source="service_ocr", pages_processed=pages_processed) if local_text else None
@@ -1455,25 +1630,13 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
         ocr_text_preview = ""
         ocr_text_length = 0
         ocr_blocks_count = 0
-        paddle_warmup_deferred = False
-
-        if image_b64 and PADDLE_OCR_ENABLE_WARMUP:
-            _start_paddle_warmup()
 
         if _upstream_proxy_enabled() and image_b64:
             try:
                 upstream_payload = dict(payload)
                 upstream_payload["strategy"] = strategy or "auto"
                 upstream = _call_upstream_json("/api/receipt/parse", method="POST", payload=upstream_payload, timeout_ms=OCR_SERVICE_UPSTREAM_TIMEOUT_MS)
-                upstream_backends = upstream.get("backends") or {}
-                if upstream_backends:
-                    backends = {
-                        "parser": upstream_backends.get("parser") is not False,
-                        "paddleocr": bool(upstream_backends.get("paddleocr")),
-                        "llm_fallback": bool(upstream_backends.get("llm_fallback") or upstream_backends.get("gemini")),
-                        "gemini": bool(upstream_backends.get("gemini")),
-                    }
-                    mode = str(upstream.get("mode") or _build_receipt_mode(backends))
+                backends, mode = _merge_upstream_runtime_state(upstream, backends)
                 upstream_result = upstream.get("result")
                 if upstream.get("ok") and upstream_result:
                     normalised = normalise_extraction(upstream_result)
@@ -1485,15 +1648,16 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                     upstream_error = str(upstream.get("details", {}).get("message") or "").strip()
             except Exception as err:
                 upstream_error = str(err or "").strip()
+                _mark_upstream_health_failure(upstream_error)
+                proxy_health = _probe_upstream_health_quick() or proxy_health
+                if proxy_health:
+                    backends, mode = _merge_upstream_runtime_state(proxy_health, backends)
 
         should_run_paddle = (
             strategy == "ocr"
             or best_result is None
             or (strategy == "auto" and _needs_llm(best_result))
         )
-        if should_run_paddle and _paddle_warmup_in_progress() and strategy != "ocr" and GEMINI_API_KEY:
-            should_run_paddle = False
-            paddle_warmup_deferred = True
         if _paddle_ocr_available() and image_b64 and should_run_paddle:
             ocr_text, blocks = ocr_with_paddle(image_b64)
             ocr_text_length = len(ocr_text or "")
@@ -1527,12 +1691,6 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                 best_result.setdefault("diagnostics", {})
                 if should_try_image_only_llm:
                     best_result["diagnostics"]["imageOnlyLlmRecovery"] = True
-                if paddle_warmup_deferred:
-                    best_result["diagnostics"]["paddleWarmupDeferred"] = True
-
-        if best_result is not None and paddle_warmup_deferred:
-            best_result.setdefault("diagnostics", {})
-            best_result["diagnostics"]["paddleWarmupDeferred"] = True
 
         if best_result is None:
             raise RuntimeError("Nenhum backend conseguiu estruturar o recibo.")
@@ -1548,11 +1706,14 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
                     else (_build_receipt_runtime_message(backends) if not _upstream_proxy_enabled() else "OCR dedicado activo via upstream.")
                 ),
                 "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
-                "proxy": {
-                    "enabled": _upstream_proxy_enabled(),
-                    "upstream": OCR_SERVICE_UPSTREAM_URL if _upstream_proxy_enabled() else "",
-                    "upstream_error": upstream_error,
-                },
+                "paddle_ready": bool(backends.get("paddle_ready")),
+                "proxy": _build_proxy_details(
+                    enabled=_upstream_proxy_enabled(),
+                    active=_upstream_proxy_enabled() and not upstream_error,
+                    cached=bool(proxy_health and proxy_health.get("_cache_age_ms")),
+                    upstream_payload=proxy_health,
+                    upstream_error=upstream_error,
+                ),
             },
             result=best_result,
             score=_score_extraction(best_result),
@@ -1560,21 +1721,36 @@ def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str
             backends=backends,
         )
     except Exception as err:
+        message = str(err) or "A leitura do recibo falhou nesta tentativa."
+        proxy_health = _probe_upstream_health_quick() or proxy_health
+        if proxy_health:
+            backends, mode = _merge_upstream_runtime_state(proxy_health, backends)
+        details = {
+            "message": (
+                f"OCR dedicado configurado, mas esta tentativa de parse falhou antes de devolver um resultado estruturado. Motivo: {upstream_error or message}"
+                if _upstream_proxy_enabled()
+                else message
+            ),
+            "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
+            "paddle_ready": bool(backends.get("paddle_ready")),
+            "ocrDiagnostics": {
+                "textLength": ocr_text_length,
+                "blockCount": ocr_blocks_count,
+                "preview": ocr_text_preview,
+            },
+            "proxy": _build_proxy_details(
+                enabled=_upstream_proxy_enabled(),
+                active=False,
+                cached=bool(proxy_health and proxy_health.get("_cache_age_ms")),
+                upstream_payload=proxy_health,
+                upstream_error=upstream_error or message,
+            ),
+        }
         return 503, build_error_payload(
             "receipt_service.receipt_parse",
             "receipt_parse_failed",
             mode=mode,
-            details={
-                "message": str(err) or "A leitura do recibo falhou nesta tentativa.",
-                "deployment": "hosted" if RUNNING_ON_VERCEL else "local",
-                "ocrDiagnostics": {
-                    "textLength": ocr_text_length,
-                    "blockCount": ocr_blocks_count,
-                    "preview": ocr_text_preview,
-                    "paddleState": _PADDLE_WARMUP_STATE,
-                    "paddleWarmupDeferred": paddle_warmup_deferred,
-                },
-            },
+            details=details,
             backends=backends,
         )
 
