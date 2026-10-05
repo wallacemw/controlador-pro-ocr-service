@@ -28,6 +28,12 @@ services:
         value: PP-OCRv5_mobile_det
       - key: OCR_SERVICE_ENFORCE_SHARED_SECRET
         value: "1"
+      - key: OCR_SERVICE_MAX_REQUEST_BYTES
+        value: "8388608"
+      - key: OCR_SERVICE_RATE_LIMIT_PER_MINUTE
+        value: "60"
+      - key: OCR_SERVICE_CORS_ORIGINS
+        value: "*"
       - key: OCR_SERVICE_SHARED_SECRET
         sync: false
       - key: GEMINI_API_KEY
