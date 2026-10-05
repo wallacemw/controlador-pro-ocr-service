@@ -69,6 +69,9 @@ OCR_SERVICE_UPSTREAM_HEALTH_TIMEOUT_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_HEA
 OCR_SERVICE_UPSTREAM_HEALTH_CACHE_TTL_MS = int(os.getenv("OCR_SERVICE_UPSTREAM_HEALTH_CACHE_TTL_MS", "180000") or "180000")
 OCR_SERVICE_SHARED_SECRET = os.getenv("OCR_SERVICE_SHARED_SECRET", "").strip()
 OCR_SERVICE_ENFORCE_SHARED_SECRET = _env_flag("OCR_SERVICE_ENFORCE_SHARED_SECRET", False)
+OCR_SERVICE_MAX_REQUEST_BYTES = max(65536, int(os.getenv("OCR_SERVICE_MAX_REQUEST_BYTES", "8388608") or "8388608"))
+OCR_SERVICE_RATE_LIMIT_PER_MINUTE = max(0, int(os.getenv("OCR_SERVICE_RATE_LIMIT_PER_MINUTE", "60") or "60"))
+OCR_SERVICE_CORS_ORIGINS = [item.strip() for item in (os.getenv("OCR_SERVICE_CORS_ORIGINS", "*") or "*").split(",") if item.strip()] or ["*"]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_RECEIPT_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 OCR_LANG = os.getenv("RECEIPT_OCR_LANG", "pt")
@@ -107,12 +110,25 @@ _UPSTREAM_HEALTH_CACHE: Dict[str, Any] = {
     "last_failure_at": "",
     "last_error": "",
 }
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
+
+
+def _cors_origin_for_request(handler: BaseHTTPRequestHandler) -> str:
+    origin = str(handler.headers.get("Origin", "") or "").strip()
+    if "*" in OCR_SERVICE_CORS_ORIGINS:
+        return "*"
+    return origin if origin and origin in OCR_SERVICE_CORS_ORIGINS else ""
 
 
 def _send_cors_headers(handler: BaseHTTPRequestHandler) -> None:
-    handler.send_header("X-Receipt-Service-Source", "codex-2.0")
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+    handler.send_header("X-Receipt-Service-Source", "codex-2.1")
+    allowed_origin = _cors_origin_for_request(handler)
+    if allowed_origin:
+        handler.send_header("Access-Control-Allow-Origin", allowed_origin)
+        if allowed_origin != "*":
+            handler.send_header("Vary", "Origin")
+    handler.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-OCR-Service-Key")
     handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     handler.send_header("Access-Control-Max-Age", "86400")
 
@@ -158,12 +174,32 @@ def build_error_payload(service: str, error: str, *, mode: str = "", details: Op
     return _response_payload(False, service, error=error, mode=mode, details=details, **extra)
 
 
+class PayloadTooLargeError(ValueError):
+    pass
+
+
 def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
-    length = int(handler.headers.get("Content-Length", "0") or "0")
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+    except (TypeError, ValueError) as err:
+        raise ValueError("Content-Length invalido.") from err
+    if length < 0:
+        raise ValueError("Content-Length invalido.")
+    if length > OCR_SERVICE_MAX_REQUEST_BYTES:
+        raise PayloadTooLargeError(
+            f"Payload excede o limite de {OCR_SERVICE_MAX_REQUEST_BYTES} bytes."
+        )
     raw = handler.rfile.read(length) if length > 0 else b"{}"
+    if len(raw) > OCR_SERVICE_MAX_REQUEST_BYTES:
+        raise PayloadTooLargeError(
+            f"Payload excede o limite de {OCR_SERVICE_MAX_REQUEST_BYTES} bytes."
+        )
     if not raw:
-      return {}
-    return json.loads(raw.decode("utf-8"))
+        return {}
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("O corpo JSON deve ser um objeto.")
+    return payload
 
 
 def _build_upstream_url(path: str) -> str:
@@ -1611,6 +1647,16 @@ def build_ably_token_response(payload: Dict[str, Any], auth_header: str) -> tupl
 
 def build_receipt_parse_response(payload: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
     strategy = str(payload.get("strategy") or "auto").strip().lower()
+    allowed_strategies = {"auto", "ocr", "llm"}
+    if strategy not in allowed_strategies:
+        return 400, build_error_payload(
+            "receipt_service.receipt_parse",
+            "strategy_invalid",
+            details={
+                "message": "strategy deve ser auto, ocr ou llm.",
+                "allowed": sorted(allowed_strategies),
+            },
+        )
     local_text = str(payload.get("localText") or "")
     image_b64 = str(payload.get("imageBase64HQ") or payload.get("imageBase64") or "")
     image_mime_type = str(payload.get("imageMimeType") or "image/jpeg").strip() or "image/jpeg"
@@ -1770,6 +1816,41 @@ def _proxy_secret_authorized(handler: BaseHTTPRequestHandler) -> bool:
     return bool(OCR_SERVICE_SHARED_SECRET) and secrets.compare_digest(provided, OCR_SERVICE_SHARED_SECRET)
 
 
+def _rate_limit_key(handler: BaseHTTPRequestHandler) -> str:
+    forwarded = str(handler.headers.get("X-Forwarded-For", "") or "").split(",", 1)[0].strip()
+    if forwarded:
+        return forwarded[:128]
+    try:
+        return str(handler.client_address[0] or "unknown")[:128]
+    except Exception:
+        return "unknown"
+
+
+def _rate_limit_allowed(handler: BaseHTTPRequestHandler) -> bool:
+    limit = OCR_SERVICE_RATE_LIMIT_PER_MINUTE
+    if limit <= 0:
+        return True
+    now = time.time()
+    cutoff = now - 60.0
+    key = _rate_limit_key(handler)
+    with _RATE_LIMIT_LOCK:
+        recent = [stamp for stamp in _RATE_LIMIT_BUCKETS.get(key, []) if stamp >= cutoff]
+        if len(recent) >= limit:
+            _RATE_LIMIT_BUCKETS[key] = recent
+            return False
+        recent.append(now)
+        _RATE_LIMIT_BUCKETS[key] = recent
+        if len(_RATE_LIMIT_BUCKETS) > 2048:
+            stale_keys = [
+                bucket_key
+                for bucket_key, stamps in _RATE_LIMIT_BUCKETS.items()
+                if not stamps or stamps[-1] < cutoff
+            ][:512]
+            for bucket_key in stale_keys:
+                _RATE_LIMIT_BUCKETS.pop(bucket_key, None)
+    return True
+
+
 class ReceiptServiceHandler(BaseHTTPRequestHandler):
     server_version = "ReceiptService/1.0"
 
@@ -1803,8 +1884,30 @@ class ReceiptServiceHandler(BaseHTTPRequestHandler):
         if not _proxy_secret_authorized(self):
             _json_response(self, 401, _proxy_secret_error_payload())
             return
+        if not _rate_limit_allowed(self):
+            _json_response(
+                self,
+                429,
+                build_error_payload(
+                    "receipt_service.receipt_parse",
+                    "rate_limited",
+                    details={"message": "Limite temporario de leituras OCR atingido. Tente novamente em instantes."},
+                ),
+            )
+            return
         try:
             payload = _read_json(self)
+        except PayloadTooLargeError as err:
+            _json_response(
+                self,
+                413,
+                build_error_payload(
+                    "receipt_service.receipt_parse",
+                    "payload_too_large",
+                    details={"message": str(err)},
+                ),
+            )
+            return
         except Exception as err:
             _json_response(self, 400, build_error_payload("receipt_service.receipt_parse", "json_invalid", details={"message": f"JSON invalido: {err}"}))
             return
