@@ -60,6 +60,9 @@ Configure no serviço OCR:
 - `GEMINI_RECEIPT_MODEL=gemini-2.5-flash`
 - `OCR_SERVICE_SHARED_SECRET=uma-chave-forte`
 - `OCR_SERVICE_ENFORCE_SHARED_SECRET=1`
+- `OCR_SERVICE_MAX_REQUEST_BYTES=8388608` (limite máximo do JSON/imagem)
+- `OCR_SERVICE_RATE_LIMIT_PER_MINUTE=60` (por IP; use `0` para desativar)
+- `OCR_SERVICE_CORS_ORIGINS=*` (pode receber uma lista de origens separadas por vírgula)
 - `PADDLE_OCR_ENABLE_WARMUP=1`
 - `PADDLE_OCR_STARTUP_GRACE_MS=15000`
 - `PADDLE_OCR_USE_DOC_ORIENTATION_CLASSIFY=0`
@@ -94,3 +97,12 @@ Não ative `OCR_SERVICE_ENFORCE_SHARED_SECRET` na Vercel; ele é usado no servi�
    - `details.message`
 3. Faça uma leitura de recibo em produção
 4. Confirme no painel técnico se o OCR saiu de `parser service` para `PaddleOCR`
+
+
+## Hardening de entrada
+
+- `strategy` aceita somente `auto`, `ocr` ou `llm`;
+- pedidos acima de `OCR_SERVICE_MAX_REQUEST_BYTES` retornam HTTP 413;
+- excesso de pedidos retorna HTTP 429;
+- o serviço dedicado exige `X-OCR-Service-Key` quando `OCR_SERVICE_ENFORCE_SHARED_SECRET=1`;
+- CORS pode ser restringido com `OCR_SERVICE_CORS_ORIGINS`.
